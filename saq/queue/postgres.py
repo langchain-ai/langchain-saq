@@ -894,8 +894,8 @@ class PostgresQueue(Queue):
                     # Pool normally performs this check when getting a connection.
                     await self.pool.check_connection(self._dequeue_conn)
                 except OperationalError:
-                    # The connection is bad so return it to the pool and get a new one.
-                    await self.pool.putconn(self._dequeue_conn)
+                    # The connection is bad so close it and get a new one.
+                    await self._dequeue_conn.close()
                     self._dequeue_conn = await self.pool.getconn()
             else:
                 self._dequeue_conn = await self.pool.getconn()
