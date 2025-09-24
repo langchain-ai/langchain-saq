@@ -1,6 +1,7 @@
 """
 Jobs
 """
+
 from __future__ import annotations
 
 import dataclasses
@@ -190,7 +191,7 @@ class Job:
 
     @property
     def abort_id(self) -> str:
-        return f"{ABORT_ID_PREFIX}{self.key}"
+        return self.get_queue().abort_key(self.key)
 
     def to_dict(self) -> dict[str, t.Any]:
         """
