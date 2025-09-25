@@ -1,26 +1,25 @@
 # This workflow will install Python dependencies, run tests and lint with a single version of Python
 # For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
 
-name: Continuous Integration
+name: SAQ Tests
 
 on:
   push:
-    branches: [ master ]
+    branches: [ main ]
   pull_request:
-    branches: [ master ]
+    branches: [ main ]
 
 jobs:
   ci:
-
     runs-on: ubuntu-latest
-    
+
     strategy:
       matrix:
-        python-version: ["3.8", "3.9", "3.10", "3.11"]
+        python-version: ["3.11", "3.12"]
     
     services:
       redis:
-        image: redis
+        image: redis:7
         ports:
         - 6379:6379
         # Set health checks to wait until redis has started
@@ -31,11 +30,50 @@ jobs:
           --health-retries 5
 
     steps:
-    - uses: actions/checkout@v2
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Set Up Docker Compose
+      run: docker compose version || sudo apt-get update && sudo apt-get install -y docker-compose-plugin
+    
+    - name: Start Redis Nodes
+      run: docker compose -f redis-docker-compose.yaml up -d
+
+    
+    - name: Wait for Redis health
+      run: |
+        for p in 30001 30002 30003; do
+          echo "Waiting for redis on $p..."
+          for i in $(seq 1 60); do
+            if redis-cli -p $p PING | grep -q PONG; then
+              echo "redis $p is up"; break
+            fi
+            sleep 1
+          done
+        done
+
+    - name: Create 3-master cluster
+      run: |
+        # Use the network created by compose so we can reach containers by service name
+        NET=$(docker network ls --format '{{.Name}}' | grep -E '(_default|^github_network$)' | head -n1 || true)
+        # Fallback to the compose project network
+        if [ -z "$NET" ]; then NET=$(docker network ls --format '{{.Name}}' | grep '_default$' | head -n1); fi
+
+        docker run --rm --network "$NET" redis:7 \
+          redis-cli --cluster create \
+            redis-30001:30001 redis-30002:30002 redis-30003:30003 \
+            --cluster-replicas 0 --cluster-yes
+
+    - name: Verify cluster
+      run: |
+        redis-cli -p 30001 cluster info
+        redis-cli -p 30001 cluster nodes
+  
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
       with:
         python-version: ${{ matrix.python-version }}
+
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
