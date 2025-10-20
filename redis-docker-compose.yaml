@@ -1,0 +1,54 @@
+services:
+  redis-30001:
+    image: redis:7
+    command: >
+      sh -c "redis-server
+      --port 30001
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --protected-mode no
+      --bind 0.0.0.0"
+    ports: ["30001:30001"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "30001", "PING"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  redis-30002:
+    image: redis:7
+    command: >
+      sh -c "redis-server
+      --port 30002
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --protected-mode no
+      --bind 0.0.0.0"
+    ports: ["30002:30002"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "30002", "PING"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
+
+  redis-30003:
+    image: redis:7
+    command: >
+      sh -c "redis-server
+      --port 30003
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --appendonly no
+      --protected-mode no
+      --bind 0.0.0.0"
+    ports: ["30003:30003"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-p", "30003", "PING"]
+      interval: 2s
+      timeout: 1s
+      retries: 30
