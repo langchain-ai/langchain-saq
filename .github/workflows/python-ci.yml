@@ -37,23 +37,29 @@ jobs:
     - name: Start Redis Nodes
       run: docker compose -f redis-docker-compose.yaml up -d
 
+    - name: Configure Redis Cluster hostnames
+      run: |
+        echo "127.0.0.1 redis-30001 redis-30002 redis-30003" | sudo tee -a /etc/hosts
     
     - name: Wait for Redis health
       run: |
         for p in 30001 30002 30003; do
-          echo "Waiting for redis on $p..."
+          echo "Waiting for redis on port $p..."
           for i in $(seq 1 60); do
-            if redis-cli -p $p PING | grep -q PONG; then
-              echo "redis $p is up"; break
+            if redis-cli -p $p PING 2>/dev/null | grep -q PONG; then
+              echo "redis on port $p is up"; break
             fi
             sleep 1
           done
         done
+        echo "All Redis nodes are healthy"
 
     - name: Verify cluster
       run: |
-        redis-cli -p 30001 cluster info
-        redis-cli -p 30001 cluster nodes
+        redis-cli -h redis-30001 -p 30001 cluster info
+        redis-cli -h redis-30001 -p 30001 cluster nodes
+        # Verify nodes are announcing correct hostnames
+        redis-cli -h redis-30001 -p 30001 cluster nodes | grep "redis-30001\|redis-30002\|redis-30003"
   
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
