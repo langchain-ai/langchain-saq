@@ -331,7 +331,9 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_update(self) -> None:
         if self.queue.is_cluster:
-            self.skipTest("update relies on notify/listen. Disabled in cluster mode.")
+            self.skipTest(
+                "update relies on notify. Notify is not used in LangSmith services."
+            )
 
         job = await self.enqueue("test")
         counter = {"x": 0}

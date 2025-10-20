@@ -218,7 +218,9 @@ class Worker:
         if not jobs:
             return
 
-        aborted = await self.queue.redis.mget(job.abort_id for job in jobs)
+        abort_ids = [job.abort_id for job in jobs]
+        # Redis-Cluster client automatically splits the mget across all nodes in the cluster.
+        aborted = await self.queue.redis.mget(*abort_ids)
 
         for job, abort in zip(jobs, aborted):
             if not abort:

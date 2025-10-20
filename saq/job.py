@@ -15,7 +15,7 @@ if t.TYPE_CHECKING:
     from saq.queue import Queue
     from saq.types import DurationKind, Function
 
-ABORT_ID_PREFIX = "saq:abort:"
+ABORT_ID_PREFIX = "saq:abort"
 
 
 def get_default_job_key() -> str:
