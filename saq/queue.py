@@ -1,6 +1,7 @@
 """
 Queues
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -81,7 +82,7 @@ class Queue:
         """Create a queue with a redis url a name."""
         return cls(aioredis.from_url(url), **kwargs)
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=too-many-positional-arguments
         self,
         redis: Redis[bytes],
         name: str = "default",
