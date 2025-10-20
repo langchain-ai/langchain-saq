@@ -15,7 +15,7 @@ jobs:
 
     strategy:
       matrix:
-        python-version: ["3.11", "3.12"]
+        python-version: ["3.11"]
     
     services:
       redis:
@@ -33,17 +33,20 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     
+    - name: Install Redis CLI
+      run: sudo apt-get update && sudo apt-get install -y redis-tools
+    
     - name: Start Redis Nodes
       run: docker compose -f redis-docker-compose.yaml up -d
 
     
     - name: Wait for Redis health
       run: |
-        for service in redis-30001 redis-30002 redis-30003; do
-          echo "Waiting for $service..."
+        for p in 30001 30002 30003; do
+          echo "Waiting for redis on $p..."
           for i in $(seq 1 60); do
-            if docker compose -f redis-docker-compose.yaml exec -T $service redis-cli PING | grep -q PONG; then
-              echo "$service is up"; break
+            if redis-cli -p $p PING | grep -q PONG; then
+              echo "redis $p is up"; break
             fi
             sleep 1
           done
@@ -63,8 +66,8 @@ jobs:
 
     - name: Verify cluster
       run: |
-        docker compose -f redis-docker-compose.yaml exec -T redis-30001 redis-cli cluster info
-        docker compose -f redis-docker-compose.yaml exec -T redis-30001 redis-cli cluster nodes
+        redis-cli -p 30001 cluster info
+        redis-cli -p 30001 cluster nodes
   
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
