@@ -33,20 +33,17 @@ jobs:
     - name: Checkout
       uses: actions/checkout@v4
     
-    - name: Install Redis CLI
-      run: sudo apt-get update && sudo apt-get install -y redis-tools
-    
     - name: Start Redis Nodes
       run: docker compose -f redis-docker-compose.yaml up -d
 
     
     - name: Wait for Redis health
       run: |
-        for p in 30001 30002 30003; do
-          echo "Waiting for redis on $p..."
+        for container in redis-30001 redis-30002 redis-30003; do
+          echo "Waiting for $container..."
           for i in $(seq 1 60); do
-            if redis-cli -p $p PING | grep -q PONG; then
-              echo "redis $p is up"; break
+            if docker exec $container redis-cli PING | grep -q PONG; then
+              echo "$container is up"; break
             fi
             sleep 1
           done
@@ -66,8 +63,8 @@ jobs:
 
     - name: Verify cluster
       run: |
-        redis-cli -p 30001 cluster info
-        redis-cli -p 30001 cluster nodes
+        docker exec redis-30001 redis-cli cluster info
+        docker exec redis-30001 redis-cli cluster nodes
   
     - name: Set up Python ${{ matrix.python-version }}
       uses: actions/setup-python@v2
