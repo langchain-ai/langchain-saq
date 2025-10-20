@@ -87,7 +87,7 @@ class Queue:
         """Create a queue with a redis url a name."""
         if is_cluster:
             return cls(
-                t.cast(Redis[bytes], RedisCluster.from_url(url)),
+                t.cast(Redis, RedisCluster.from_url(url)),  # type: ignore[type-var,unused-ignore]
                 is_cluster=True,
                 **kwargs,
             )
@@ -126,8 +126,7 @@ class Queue:
         self._load = load or json.loads
         self._before_enqueues: dict[int, BeforeEnqueueType] = {}
         self._op_sem = asyncio.Semaphore(max_concurrent_ops)
-        # PubSub is not supported by RedisCluster (redis-py). In cluster mode, fall back to polling.
-        # Use the job_id("") as the pubsub prefix so the pattern aligns with the actual channel keys
+        # PubSub is not supported by RedisCluster (redis-py). In cluster mode, we no-op pubsub. It is not used in LangSmith services.
         if self.is_cluster:
             self._pubsub = None
         else:
@@ -386,6 +385,7 @@ class Queue:
             timeout: if timeout is truthy, wait for timeout seconds
         """
         job_ids = [self.job_id(job_key) for job_key in job_keys]
+        # This no-ops in cluster mode, as we don't use pubsub in LangSmith services.
         if not job_ids or self._pubsub is None:
             return
 
@@ -415,7 +415,7 @@ class Queue:
             if self._pubsub is not None:
                 await self._pubsub.unsubscribe(queue)
 
-    # We no-op this method in the super class of Queue that we use in LangSmith.
+    # NOTE: We no-op this method in the super class of Queue that we use in LangSmith.
     async def notify(self, job: Job) -> None:
         if not self.is_cluster:
             await self.redis.publish(job.id, job.status)

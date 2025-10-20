@@ -12,7 +12,7 @@ def create_queue(**kwargs: t.Any) -> Queue:
 
 
 def create_cluster_queue(name: str = "default", **kwargs: t.Any) -> Queue:
-    redis = cast(Redis, RedisCluster.from_url("redis://localhost:30001"))
+    redis = cast(Redis, RedisCluster.from_url("redis://redis-30001:30001"))
     return Queue(
         redis,
         is_cluster=True,
@@ -21,6 +21,10 @@ def create_cluster_queue(name: str = "default", **kwargs: t.Any) -> Queue:
     )
 
 
+# NOTE: ONLY USE THIS FOR TESTS. DO NOT USE IN PRODUCTION.
 async def cleanup_queue(queue: Queue) -> None:
-    await queue.redis.flushdb()
+    if queue.is_cluster:
+        await queue.redis.flushall()
+    else:
+        await queue.redis.flushdb()
     await queue.disconnect()

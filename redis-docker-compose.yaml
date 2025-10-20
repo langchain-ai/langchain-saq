@@ -1,16 +1,19 @@
 services:
   redis-30001:
     image: redis:7
+    container_name: redis-30001
+    ports: ["30001:30001"]
     command: >
       sh -c "redis-server
       --port 30001
       --cluster-enabled yes
       --cluster-config-file nodes.conf
       --cluster-node-timeout 5000
+      --cluster-announce-ip redis-30001
+      --cluster-announce-port 30001
       --appendonly no
       --protected-mode no
       --bind 0.0.0.0"
-    ports: ["30001:30001"]
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "30001", "PING"]
       interval: 2s
@@ -19,16 +22,19 @@ services:
 
   redis-30002:
     image: redis:7
+    container_name: redis-30002
+    ports: ["30002:30002"]
     command: >
       sh -c "redis-server
       --port 30002
       --cluster-enabled yes
       --cluster-config-file nodes.conf
       --cluster-node-timeout 5000
+      --cluster-announce-ip redis-30002
+      --cluster-announce-port 30002
       --appendonly no
       --protected-mode no
       --bind 0.0.0.0"
-    ports: ["30002:30002"]
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "30002", "PING"]
       interval: 2s
@@ -37,18 +43,41 @@ services:
 
   redis-30003:
     image: redis:7
+    container_name: redis-30003
+    ports: ["30003:30003"]
     command: >
       sh -c "redis-server
       --port 30003
       --cluster-enabled yes
       --cluster-config-file nodes.conf
       --cluster-node-timeout 5000
+      --cluster-announce-ip redis-30003
+      --cluster-announce-port 30003
       --appendonly no
       --protected-mode no
       --bind 0.0.0.0"
-    ports: ["30003:30003"]
     healthcheck:
       test: ["CMD", "redis-cli", "-p", "30003", "PING"]
       interval: 2s
       timeout: 1s
       retries: 30
+
+  redis-cluster-init:
+    image: redis:7
+    depends_on:
+      redis-30001:
+        condition: service_healthy
+      redis-30002:
+        condition: service_healthy
+      redis-30003:
+        condition: service_healthy
+    command: >
+      sh -c "
+      redis-cli --cluster create
+      redis-30001:30001
+      redis-30002:30002
+      redis-30003:30003
+      --cluster-replicas 0
+      --cluster-yes
+      "
+    restart: "no"
