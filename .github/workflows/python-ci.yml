@@ -52,18 +52,6 @@ jobs:
           done
         done
 
-    - name: Create 3-master cluster
-      run: |
-        # Use the network created by compose so we can reach containers by service name
-        NET=$(docker network ls --format '{{.Name}}' | grep -E '(_default|^github_network$)' | head -n1 || true)
-        # Fallback to the compose project network
-        if [ -z "$NET" ]; then NET=$(docker network ls --format '{{.Name}}' | grep '_default$' | head -n1); fi
-
-        docker run --rm --network "$NET" redis:7 \
-          redis-cli --cluster create \
-            redis-30001:30001 redis-30002:30002 redis-30003:30003 \
-            --cluster-replicas 0 --cluster-yes
-
     - name: Verify cluster
       run: |
         redis-cli -p 30001 cluster info
