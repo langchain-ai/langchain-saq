@@ -2,11 +2,11 @@ import asyncio
 import sys
 import time
 
-from benchmarks.funcs import *
+from funcs import *
 
 
 SEM = asyncio.Semaphore(20)
-N = 1000
+N = 10_000
 
 
 async def sem_task(task):
@@ -14,47 +14,22 @@ async def sem_task(task):
         return await task
 
 
-async def bench_arq():
-    from arq import create_pool
-    from arq.connections import RedisSettings
-    from arq.worker import Worker
-
-    async def enqueue(func):
-        await asyncio.gather(
-            *[asyncio.create_task(sem_task(redis.enqueue_job(func))) for _ in range(N)]
-        )
-
-    redis = await create_pool(RedisSettings())
-    worker = Worker(functions=[noop, sleeper], max_jobs=10, burst=True)
-    worker.loop = asyncio.get_event_loop()
-
-    now = time.time()
-    await enqueue("noop")
-    print(f"ARQ enqueue {N} {time.time() - now}")
-
-    now = time.time()
-    await worker.main()
-    print(f"ARQ process {N} noop {time.time() - now}")
-
-    await enqueue("sleeper")
-    now = time.time()
-    await worker.main()
-    print(f"ARQ process {N} sleep {time.time() - now}")
-
-
-async def bench_saq():
+async def bench_saq(cluster: bool = False):
     from saq import Queue, Worker
 
-    async def enqueue(func):
+    async def enqueue(func, count):
         await asyncio.gather(
-            *[asyncio.create_task(queue.enqueue(func)) for _ in range(N)]
+            *[asyncio.create_task(queue.enqueue(func)) for _ in range(count)]
         )
 
-    queue = Queue.from_url("redis://localhost")
+    if cluster:
+        queue = Queue.from_url("redis://localhost:30001", is_cluster=True)
+    else:
+        queue = Queue.from_url("redis://localhost:6379")
     worker = Worker(queue=queue, functions=[noop, sleeper], concurrency=10)
 
     now = time.time()
-    await enqueue("noop")
+    await enqueue("noop", N)
     print(f"SAQ enqueue {N} {time.time() - now}")
 
     now = time.time()
@@ -64,44 +39,28 @@ async def bench_saq():
         await asyncio.sleep(0.1)
     print(f"SAQ process {N} noop {time.time() - now}")
 
-    await enqueue("sleeper")
+    await enqueue("sleeper", 1000)
     now = time.time()
     while await queue.count("incomplete"):
         await asyncio.sleep(0.1)
-    print(f"SAQ process {N} sleep {time.time() - now}")
-
-
-def bench_rq():
-    from rq import Connection, Queue, Worker
-
-    with Connection() as connection:
-        queue = Queue(connection=connection)
-        worker = Worker("default", log_job_description=False)
-
-        def enqueue(func):
-            for _ in range(N):
-                queue.enqueue(func)
-
-        now = time.time()
-        enqueue(sync_noop)
-        print(f"RQ enqueue {N} {time.time() - now}")
-        worker.work(burst=True)
-        print(f"RQ process {N} noop {time.time() - now}")
-
-        enqueue(sync_sleeper)
-        worker.work(burst=True)
-        print(f"RQ process {N} sleep {time.time() - now}")
-
+    print(f"SAQ process 1000 sleep {time.time() - now}")
 
 async def main():
-    lib = sys.argv[1]
+    print("=" * 60)
+    print("Running SAQ Benchmark (Regular Mode)")
+    print("=" * 60)
+    await bench_saq(cluster=False)
+    print()
 
-    if lib == "arq":
-        await bench_arq()
-    elif lib == "rq":
-        bench_rq()
-    else:
-        await bench_saq()
+    print("=" * 60)
+    print("Running SAQ Benchmark (Cluster Mode)")
+    print("=" * 60)
+    try:
+        await bench_saq(cluster=True)
+    except Exception as e:
+        print(f"SAQ Cluster mode failed: {e}")
+        print("Make sure Redis cluster is running (see redis-docker-compose.yaml)")
+    print()
 
 
 if __name__ == "__main__":
