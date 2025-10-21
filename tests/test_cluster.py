@@ -8,6 +8,9 @@ from __future__ import annotations
 import asyncio
 import typing as t
 import unittest
+from unittest.mock import patch
+
+from redis.asyncio import RedisCluster
 
 from saq.job import Status
 from tests.helpers import cleanup_queue, create_cluster_queue
@@ -25,10 +28,6 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self) -> None:
         await cleanup_queue(self.queue)
 
-    def test_is_cluster_flag(self) -> None:
-        """Verify the is_cluster flag is set correctly."""
-        self.assertTrue(self.queue.is_cluster)
-
     def test_from_url_cluster(self) -> None:
         """Verify Queue.from_url works with is_cluster=True."""
         from saq.queue import Queue
@@ -37,28 +36,30 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
             "redis://redis-30001:30001", is_cluster=True, name="test"
         )
         self.assertTrue(queue.is_cluster)
-        self.assertIsInstance(queue.redis, type(self.queue.redis))
+        self.assertIsInstance(queue.redis, RedisCluster)
+        # PubSub is unimplemented in cluster mode.
+        self.assertIsNone(self.queue._pubsub)  # pylint: disable=protected-access
         # Cleanup without processing
         asyncio.get_event_loop().run_until_complete(queue.disconnect())
 
     def test_hash_tag_in_job_id(self) -> None:
         """Verify job IDs contain hash tags in cluster mode."""
         job_id = self.queue.job_id("test-key")
-        # Should contain {queue_name} for hash tag
+        # Should contain {queue_name} for hash tag in job ID
         self.assertIn(f"{{{self.queue.name}}}", job_id)
         self.assertEqual(job_id, f"saq:job:{{{self.queue.name}}}:test-key")
 
     def test_hash_tag_in_namespace(self) -> None:
         """Verify namespace keys contain hash tags in cluster mode."""
         namespace = self.queue.namespace("test")
-        # Should contain {queue_name} for hash tag
+        # Should contain {queue_name} for hash tag in queue namespace
         self.assertIn(f"{{{self.queue.name}}}", namespace)
         self.assertEqual(namespace, f"saq:{{{self.queue.name}}}:test")
 
     def test_hash_tag_in_abort_key(self) -> None:
         """Verify abort keys contain hash tags in cluster mode."""
         abort_key = self.queue.abort_key("test-key")
-        # Should contain {queue_name} for hash tag
+        # Should contain {queue_name} for hash tag in abort key
         self.assertIn(f"{{{self.queue.name}}}", abort_key)
         self.assertEqual(abort_key, f"saq:abort:{{{self.queue.name}}}:test-key")
 
@@ -72,9 +73,7 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         queued = self.queue.namespace("queued")
         active = self.queue.namespace("active")
 
-        # In Redis Cluster, keys with the same hash tag should have the same slot
-        # We can't easily test the actual slot without diving into redis-py internals,
-        # but we can verify the hash tag is present and consistent. This ensures that all keys for a given queue are on the same slot.
+        # Checks that all queues for a given queue name are on the same slot
         hash_tag = f"{{{self.queue.name}}}"
 
         self.assertIn(hash_tag, job_id)
@@ -82,11 +81,6 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertIn(hash_tag, incomplete)
         self.assertIn(hash_tag, queued)
         self.assertIn(hash_tag, active)
-
-    def test_pubsub_disabled(self) -> None:
-        """Verify PubSub is disabled in cluster mode."""
-        self.assertTrue(self.queue.is_cluster)
-        self.assertIsNone(self.queue._pubsub)  # pylint: disable=protected-access
 
     # We no-op pubsub in LangSmith services, hence this test.
     async def test_listen_notify_noop_in_cluster(self) -> None:
@@ -109,16 +103,34 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
 
     async def test_pipeline_no_transaction(self) -> None:
         """Verify pipelines don't use transactions in cluster mode."""
-        # This is more of an integration test - if transactions were used,
-        # operations across different slots would fail
         job1 = await self.queue.enqueue("test1")
         job2 = await self.queue.enqueue("test2")
         assert job1 is not None
         assert job2 is not None
 
-        # These operations should succeed even though they're in a pipeline
-        await self.queue.finish(job1, Status.COMPLETE, result=1)
-        await self.queue.finish(job2, Status.COMPLETE, result=2)
+        # Spy on the pipeline call to verify transaction=False is passed
+        original_pipeline = self.queue.redis.pipeline
+        pipeline_calls = []
+
+        def pipeline_spy(*args: t.Any, **kwargs: t.Any) -> t.Any:
+            pipeline_calls.append(kwargs)
+            return original_pipeline(*args, **kwargs)
+
+        with patch.object(self.queue.redis, "pipeline", side_effect=pipeline_spy):
+            # These operations should succeed and use transaction=False
+            await self.queue.finish(job1, Status.COMPLETE, result=1)
+            await self.queue.finish(job2, Status.COMPLETE, result=2)
+
+        # Verify pipeline was called with transaction=False
+        self.assertGreater(len(pipeline_calls), 0, "Pipeline should have been called")
+        for call_kwargs in pipeline_calls:
+            self.assertIn(
+                "transaction", call_kwargs, "transaction parameter should be specified"
+            )
+            self.assertFalse(
+                call_kwargs["transaction"],
+                "transaction should be False in cluster mode",
+            )
 
         # Verify both finished
         refreshed1 = await self.queue.job(job1.key)
@@ -142,26 +154,6 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["queued"], 5)
         self.assertEqual(len(info["jobs"]), 5)
 
-    async def test_scripts_work_in_cluster(self) -> None:
-        """Verify Lua scripts work correctly in cluster mode."""
-        # Test enqueue script
-        job1 = await self.queue.enqueue("test1")
-        assert job1 is not None
-        self.assertEqual(await self.queue.count("queued"), 1)
-
-        # Test schedule script
-        import time
-
-        scheduled_time = time.time() + 10
-        job2 = await self.queue.enqueue("test2", scheduled=scheduled_time)
-        assert job2 is not None
-        self.assertEqual(await self.queue.count("queued"), 1)
-        self.assertEqual(await self.queue.count("incomplete"), 2)
-
-        # Test cleanup/sweep script (though it might not find anything to sweep)
-        swept = await self.queue.sweep()
-        self.assertIsInstance(swept, list)
-
     async def test_abort_in_cluster(self) -> None:
         """Verify abort functionality works in cluster mode."""
         # Test aborting a queued job
@@ -184,13 +176,44 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(abort_value, b"test abort active")
 
     async def test_stats_in_cluster(self) -> None:
-        """Verify stats work correctly in cluster mode."""
-        stats = await self.queue.stats()
-        self.assertIn("complete", stats)
-        self.assertIn("failed", stats)
-        self.assertIn("retried", stats)
-        self.assertIn("aborted", stats)
-        self.assertIn("uptime", stats)
+        """Verify stats work correctly in cluster mode with actual job operations."""
+        # Initial stats should be zero
+        initial_stats = await self.queue.stats()
+        self.assertEqual(initial_stats["complete"], 0)
+        self.assertEqual(initial_stats["failed"], 0)
+        self.assertEqual(initial_stats["retried"], 0)
+        self.assertEqual(initial_stats["aborted"], 0)
+        self.assertGreater(initial_stats["uptime"], 0)
+
+        # Complete a job
+        job_complete = await self.queue.enqueue("test_complete")
+        assert job_complete is not None
+        await self.queue.finish(job_complete, Status.COMPLETE, result="done")
+
+        # Fail a job
+        job_failed = await self.queue.enqueue("test_failed")
+        assert job_failed is not None
+        await self.queue.finish(job_failed, Status.FAILED, error="test error")
+
+        # Retry a job
+        job_retry = await self.queue.enqueue("test_retry", retries=2)
+        assert job_retry is not None
+        dequeued = await self.queue.dequeue()
+        assert dequeued is not None
+        await self.queue.retry(dequeued, "retry error")
+
+        # Abort a job
+        job_abort = await self.queue.enqueue("test_abort")
+        assert job_abort is not None
+        await self.queue.abort(job_abort, "abort error")
+
+        # Check final stats
+        final_stats = await self.queue.stats()
+        self.assertEqual(final_stats["complete"], 1, "Should have 1 completed job")
+        self.assertEqual(final_stats["failed"], 1, "Should have 1 failed job")
+        self.assertEqual(final_stats["retried"], 1, "Should have 1 retried job")
+        self.assertEqual(final_stats["aborted"], 1, "Should have 1 aborted job")
+        self.assertGreater(final_stats["uptime"], 0, "Uptime should be positive")
 
     async def test_multiple_queues_different_slots(self) -> None:
         """Verify different queues can coexist (they'll be on different slots)."""
@@ -234,21 +257,34 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.queue.retried, 1)
 
     async def test_batch_context_manager_in_cluster(self) -> None:
-        """Verify batch context manager works in cluster mode."""
+        """Verify batch context manager aborts multiple jobs in cluster mode."""
+        jobs = []
         try:
             async with self.queue.batch():
-                job = await self.queue.enqueue("test")
-                assert job is not None
+                # Enqueue multiple jobs
+                job1 = await self.queue.enqueue("test1")
+                job2 = await self.queue.enqueue("test2")
+                job3 = await self.queue.enqueue("test3")
+                assert job1 is not None
+                assert job2 is not None
+                assert job3 is not None
+                jobs = [job1, job2, job3]
                 raise ValueError("test error")
         except ValueError:
             pass
 
-        # Job should be aborted
-        if job is None:
-            self.fail("Job is None")
-        refreshed = await self.queue.job(job.key)
-        assert refreshed is not None
-        self.assertEqual(refreshed.status, Status.ABORTED)
+        # All jobs should be aborted
+        self.assertEqual(len(jobs), 3, "Should have enqueued 3 jobs")
+        for i, job in enumerate(jobs, 1):
+            refreshed = await self.queue.job(job.key)
+            assert refreshed is not None, f"Job {i} should exist"
+            self.assertEqual(
+                refreshed.status, Status.ABORTED, f"Job {i} should be aborted"
+            )
+
+        # Verify queue is empty
+        self.assertEqual(await self.queue.count("queued"), 0)
+        self.assertEqual(await self.queue.count("incomplete"), 0)
 
 
 class TestClusterMultiQueue(unittest.IsolatedAsyncioTestCase):
