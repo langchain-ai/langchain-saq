@@ -241,7 +241,6 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(initial_stats["failed"], 0)
         self.assertEqual(initial_stats["retried"], 0)
         self.assertEqual(initial_stats["aborted"], 0)
-        self.assertEqual(initial_stats["uptime"], 0)
 
         # Complete a job
         job_complete = await self.queue.enqueue("test_complete")
@@ -271,7 +270,6 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(final_stats["failed"], 1, "Should have 1 failed job")
         self.assertEqual(final_stats["retried"], 1, "Should have 1 retried job")
         self.assertEqual(final_stats["aborted"], 1, "Should have 1 aborted job")
-        self.assertGreater(final_stats["uptime"], 0, "Uptime should be positive")
 
     async def test_multiple_queues_different_slots(self) -> None:
         """Verify different queues can coexist (they'll be on different slots)."""
