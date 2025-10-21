@@ -120,27 +120,6 @@ class TestClusterWorker(unittest.IsolatedAsyncioTestCase):
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
 
-    async def test_sweep_in_cluster(self) -> None:
-        """Verify sweep functionality works in cluster mode."""
-        # Create a stuck job by manually manipulating it
-        job = await self.enqueue("simple_task", value=1, timeout=1, heartbeat=1)
-        await self.queue.dequeue()
-
-        # Manually update job to make it appear stuck
-        job.status = Status.ACTIVE
-        job.started = 1000  # Very old timestamp
-        await self.queue.update(job)
-
-        # Sweep should find and abort it
-        from unittest import mock
-
-        with mock.patch("saq.utils.time") as mock_time:
-            mock_time.time.return_value = 10000  # Much later
-            swept = await self.queue.sweep()
-
-        self.assertGreater(len(swept), 0)
-        self.assertIn(job.id.encode(), swept)
-
     async def test_stats_update(self) -> None:
         """Verify stats updates work in cluster mode."""
         job1 = await self.enqueue("simple_task", value=1)
@@ -202,25 +181,6 @@ class TestClusterWorker(unittest.IsolatedAsyncioTestCase):
         await job.refresh()
         self.assertEqual(job.status, Status.QUEUED)  # Still queued, not active
 
-    async def test_info_with_active_jobs(self) -> None:
-        """Verify queue.info() works correctly in cluster mode with active jobs."""
-        await self.enqueue("simple_task", value=1)
-
-        # Start processing but don't complete
-        dequeued = await self.queue.dequeue()
-        assert dequeued is not None
-
-        info = await self.queue.info(jobs=True)
-        self.assertEqual(info["active"], 1)
-        self.assertEqual(info["queued"], 0)
-        self.assertEqual(len(info["jobs"]), 1)
-
-        # Complete the job
-        await self.queue.finish(dequeued, Status.COMPLETE, result=2)
-
-        info = await self.queue.info(jobs=False)
-        self.assertEqual(info["active"], 0)
-
     async def test_retry_with_delay(self) -> None:
         """Verify retry delay works in cluster mode."""
         import time
@@ -239,23 +199,6 @@ class TestClusterWorker(unittest.IsolatedAsyncioTestCase):
         if scheduled_time is None:
             self.fail("Scheduled time is None")
         self.assertTrue(scheduled_time > time.time() + 50)  # At least 50s in future
-
-    async def test_heartbeat_update(self) -> None:
-        """Verify job updates (heartbeat) work in cluster mode."""
-        job = await self.enqueue("simple_task", value=1)
-
-        # Dequeue and update
-        dequeued = await self.queue.dequeue()
-        assert dequeued is not None
-
-        original_touched = dequeued.touched
-        await asyncio.sleep(0.01)
-        await dequeued.update(progress=0.5)
-
-        # Verify update worked
-        await job.refresh()
-        self.assertEqual(job.progress, 0.5)
-        self.assertGreater(job.touched, original_touched)
 
 
 class TestClusterWorkerMultiQueue(unittest.IsolatedAsyncioTestCase):

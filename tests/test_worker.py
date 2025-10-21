@@ -10,7 +10,7 @@ from unittest import mock
 from saq.job import CronJob, Job, Status
 from saq.utils import uuid1
 from saq.worker import Worker
-from tests.helpers import cleanup_queue, create_queue
+from tests.helpers import cleanup_queue, create_cluster_queue, create_queue
 
 if t.TYPE_CHECKING:
     from unittest.mock import MagicMock
@@ -55,9 +55,11 @@ async def recurse(ctx: Context, *, n: int) -> list[str]:
 functions: list[Function] = [noop, sleeper, error, sync_echo_ctx, recurse]
 
 
-class TestWorker(unittest.IsolatedAsyncioTestCase):
+class BaseWorkerTests(unittest.IsolatedAsyncioTestCase):
+    _factory = staticmethod(create_queue)
+
     def setUp(self) -> None:
-        self.queue = create_queue()
+        self.queue = self._factory()
         self.worker = Worker(self.queue, functions=functions)
 
     async def asyncTearDown(self) -> None:
@@ -69,6 +71,11 @@ class TestWorker(unittest.IsolatedAsyncioTestCase):
         return job
 
     async def test_start(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest(
+                "start test relies on refresh, which relies on listen. Disabled in cluster mode."
+            )
+
         task = asyncio.create_task(self.worker.start())
         job = await self.enqueue("noop")
         await job.refresh(1)
@@ -278,10 +285,20 @@ class TestWorker(unittest.IsolatedAsyncioTestCase):
         await worker.schedule()
         self.assertEqual(await self.queue.count("queued"), 1)
         self.assertEqual(await self.queue.count("incomplete"), 1)
-        mock_logger.info.assert_any_call("Scheduled %s", [b"saq:job:default:cron:cron"])
+        if not self.queue.is_cluster:
+            mock_logger.info.assert_any_call(
+                "Scheduled %s", [b"saq:job:default:cron:cron"]
+            )
+        else:
+            mock_logger.info.assert_any_call(
+                "Scheduled %s", [b"saq:job:{default}:cron:cron"]
+            )
 
     @mock.patch("saq.worker.logger")
     async def test_abort(self, mock_logger: MagicMock) -> None:
+        if self.queue.is_cluster:
+            self.skipTest("abort test relies on listen. Disabled in cluster mode.")
+
         job = await self.enqueue("sleeper")
         self.worker.context["sleep"] = 60
         asyncio.create_task(self.worker.process())
@@ -323,6 +340,11 @@ class TestWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.queue.count("active"), 0)
 
     async def test_sync_function(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest(
+                "sync function test relies on apply, which relies on listen. Disabled in cluster mode."
+            )
+
         async def before_process(*_: t.Any, **__: t.Any) -> None:
             ctx_var.set("123")
 
@@ -331,6 +353,11 @@ class TestWorker(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.queue.apply("sync_echo_ctx"), "123")
 
     async def test_propagation(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest(
+                "propagation test relies on apply, which relies on listen. Disabled in cluster mode."
+            )
+
         async def before_process(ctx: Context) -> None:
             correlation_id = ctx["job"].meta.get("correlation_id")
             ctx_var.set(correlation_id)  # type: ignore
@@ -345,3 +372,11 @@ class TestWorker(unittest.IsolatedAsyncioTestCase):
         correlation_ids = await self.queue.apply("recurse", n=2)
         self.assertEqual(len(correlation_ids), 3)
         self.assertTrue(all(cid == correlation_ids[0] for cid in correlation_ids[1:]))
+
+
+class TestWorker(BaseWorkerTests):
+    _factory = staticmethod(create_queue)
+
+
+class TestWorkerCluster(BaseWorkerTests):
+    _factory = staticmethod(create_cluster_queue)
