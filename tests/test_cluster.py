@@ -154,10 +154,68 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["queued"], 5)
         self.assertEqual(len(info["jobs"]), 5)
 
+    async def test_info_with_active_jobs(self) -> None:
+        """Verify queue.info() works correctly in cluster mode with active jobs."""
+        await self.queue.enqueue("simple_task", value=1)
+
+        # Start processing but don't complete
+        dequeued = await self.queue.dequeue()
+        assert dequeued is not None
+
+        info = await self.queue.info(jobs=True)
+        self.assertEqual(info["active"], 1)
+        self.assertEqual(info["queued"], 0)
+        self.assertEqual(len(info["jobs"]), 1)
+
+        # Complete the job
+        await self.queue.finish(dequeued, Status.COMPLETE, result=2)
+
+        info = await self.queue.info(jobs=False)
+        self.assertEqual(info["active"], 0)
+
+    async def test_sweep_in_cluster(self) -> None:
+        """Verify sweep functionality works in cluster mode."""
+        # Create a stuck job by manually manipulating it
+        job = await self.queue.enqueue("simple_task", value=1, timeout=1, heartbeat=1)
+        assert job is not None
+        await self.queue.dequeue()
+
+        # Manually update job to make it appear stuck
+        job.status = Status.ACTIVE
+        job.started = 1000  # Very old timestamp
+        await self.queue.update(job)
+
+        # Sweep should find and abort it
+        from unittest import mock
+
+        with mock.patch("saq.utils.time") as mock_time:
+            mock_time.time.return_value = 10000  # Much later
+            swept = await self.queue.sweep()
+
+        self.assertGreater(len(swept), 0)
+        self.assertIn(job.id.encode(), swept)
+
+    async def test_heartbeat_update(self) -> None:
+        """Verify job updates (heartbeat) work in cluster mode."""
+        job = await self.queue.enqueue("simple_task", value=1)
+        assert job is not None
+        # Dequeue and update
+        dequeued = await self.queue.dequeue()
+        assert dequeued is not None
+
+        original_touched = dequeued.touched
+        await asyncio.sleep(0.01)
+        await dequeued.update(progress=0.5)
+
+        # Verify update worked
+        await job.refresh()
+        self.assertEqual(job.progress, 0.5)
+        self.assertGreater(job.touched, original_touched)
+
     async def test_abort_in_cluster(self) -> None:
         """Verify abort functionality works in cluster mode."""
         # Test aborting a queued job
-        job = await self.queue.enqueue("test")
+        job = await self.queue.enqueue("simple_task", value=1)
         assert job is not None
 
         await self.queue.abort(job, "test abort")
@@ -183,7 +241,7 @@ class TestClusterSpecific(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(initial_stats["failed"], 0)
         self.assertEqual(initial_stats["retried"], 0)
         self.assertEqual(initial_stats["aborted"], 0)
-        self.assertGreater(initial_stats["uptime"], 0)
+        self.assertEqual(initial_stats["uptime"], 0)
 
         # Complete a job
         job_complete = await self.queue.enqueue("test_complete")

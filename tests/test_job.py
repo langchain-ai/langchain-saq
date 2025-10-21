@@ -6,15 +6,17 @@ import unittest
 from unittest import mock
 
 from saq.job import Job, Status
-from tests.helpers import cleanup_queue, create_queue
+from tests.helpers import cleanup_queue, create_cluster_queue, create_queue
 
 if t.TYPE_CHECKING:
     from unittest.mock import MagicMock
 
 
-class TestJob(unittest.IsolatedAsyncioTestCase):
+class BaseJobTests(unittest.IsolatedAsyncioTestCase):
+    _factory = staticmethod(create_queue)
+
     def setUp(self) -> None:
-        self.queue = create_queue()
+        self.queue = self._factory()
         self.job = Job("func", queue=self.queue)
 
     async def asyncTearDown(self) -> None:
@@ -66,6 +68,9 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.job.attempts, 1)
 
     async def test_refresh(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest("refresh test relies on listen. Disabled in cluster mode.")
+
         with self.assertRaises(RuntimeError):
             await self.job.refresh()
 
@@ -115,3 +120,11 @@ class TestJob(unittest.IsolatedAsyncioTestCase):
             "queue": self.queue.name,
             "meta": {"x": 1},
         }
+
+
+class TestJob(BaseJobTests):
+    _factory = staticmethod(create_queue)
+
+
+class TestJobCluster(BaseJobTests):
+    _factory = staticmethod(create_cluster_queue)
