@@ -76,6 +76,10 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
     async def test_enqueue_dup(self) -> None:
         job = await self.enqueue("test", key="1")
         self.assertEqual(job.id, self.queue.job_id("1"))
+        if not self.queue.is_cluster:
+            self.assertEqual(job.id, "saq:job:default:1")
+        else:
+            self.assertEqual(job.id, "saq:job:{default}:1")
         self.assertIsNone(await self.queue.enqueue("test", key="1"))
         self.assertIsNone(await self.queue.enqueue(job))
 
