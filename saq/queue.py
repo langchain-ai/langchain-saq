@@ -13,6 +13,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from redis import asyncio as aioredis
+from redis.asyncio.client import Redis
 from redis.asyncio.cluster import RedisCluster
 
 from saq.job import (
@@ -21,16 +22,14 @@ from saq.job import (
     Job,
     Status,
     get_default_job_key,
+    ABORT_ID_PREFIX,
 )
 from saq.utils import millis, now, seconds, uuid1
-from job import ABORT_ID_PREFIX
 
 if t.TYPE_CHECKING:
-    from job import ABORT_ID_PREFIX
     from collections.abc import AsyncIterator, Iterable, Sequence
 
-    from redis.asyncio.client import Redis, PubSub
-    from redis.asyncio.cluster import RedisCluster
+    from redis.asyncio.client import PubSub
     from redis.commands.core import AsyncScript
 
     from saq.types import (
@@ -82,16 +81,22 @@ class Queue:
     """
 
     @classmethod
-    def from_url(cls: type[QueueT], url: str, is_cluster: bool = False, **kwargs: t.Any) -> QueueT:
+    def from_url(
+        cls: type[QueueT], url: str, is_cluster: bool = False, **kwargs: t.Any
+    ) -> QueueT:
         """Create a queue with a redis url a name."""
         if is_cluster:
-            return cls(RedisCluster.from_url(url), is_cluster=True, **kwargs)
-        else:
-            return cls(aioredis.from_url(url), is_cluster=False, **kwargs)
+            return cls(
+                t.cast(Redis[bytes], RedisCluster.from_url(url)),
+                is_cluster=True,
+                **kwargs,
+            )
+
+        return cls(aioredis.from_url(url), is_cluster=False, **kwargs)
 
     def __init__(  # pylint: disable=too-many-positional-arguments
         self,
-        redis: Redis[bytes] | RedisCluster[bytes],
+        redis: Redis[bytes],
         is_cluster: bool = False,
         name: str = "default",
         dump: DumpType | None = None,
@@ -121,10 +126,12 @@ class Queue:
         self._load = load or json.loads
         self._before_enqueues: dict[int, BeforeEnqueueType] = {}
         self._op_sem = asyncio.Semaphore(max_concurrent_ops)
+        # PubSub is not supported by RedisCluster (redis-py). In cluster mode, fall back to polling.
         # Use the job_id("") as the pubsub prefix so the pattern aligns with the actual channel keys
-        self._pubsub = PubSubMultiplexer(
-            redis.pubsub(), prefix=self.job_id("")
-        )
+        if self.is_cluster:
+            self._pubsub = None
+        else:
+            self._pubsub = PubSubMultiplexer(redis.pubsub(), prefix=self.job_id(""))
 
     def __repr__(self) -> str:
         return f"{self.__class__.__name__}<redis={self.redis}, name='{self.name}'>"
@@ -160,9 +167,9 @@ class Queue:
         # In cluster mode, we hash tag the queue name so the abort key shares the same slot as the queue and job.
         if self.is_cluster:
             return ":".join([ABORT_ID_PREFIX, f"{{{self.name}}}", job_key])
-        else:
-            # Else, use the legacy format
-            return f"{ABORT_ID_PREFIX}{job_key}"
+
+        # Else, use the legacy format
+        return f"{ABORT_ID_PREFIX}{job_key}"
 
     def serialize(self, job: Job) -> str:
         return self._dump(job.to_dict())
@@ -177,12 +184,15 @@ class Queue:
         return Job(**job_dict, queue=self)
 
     async def disconnect(self) -> None:
-        await self._pubsub.close()
+        if self._pubsub is not None:
+            await self._pubsub.close()
+
         if hasattr(self.redis, "aclose"):
             await self.redis.aclose()
         else:
             await self.redis.close()
-        await self.redis.connection_pool.disconnect()
+        if not self.is_cluster:
+            await self.redis.connection_pool.disconnect()
 
     async def version(self) -> VersionTuple:
         if self._version is None:
@@ -202,15 +212,18 @@ class Queue:
             limit: Max length of job info (default 10)
         """
         # pylint: disable=too-many-locals
-        worker_uuids = []
-
+        worker_uuids: list[str] = []
         for key in await self.redis.zrangebyscore(self._stats, now(), "inf"):
             key_str = key.decode("utf-8")
             *_, worker_uuid = key_str.split(":")
             worker_uuids.append(worker_uuid)
 
-        worker_stats = await self.redis.mget(
+        worker_stat_keys = [
             self.namespace(f"stats:{worker_uuid}") for worker_uuid in worker_uuids
+        ]
+        # Only call mget if we have worker stat keys. Without this, we get error in cluster mode.
+        worker_stats = (
+            await self.redis.mget(*worker_stat_keys) if worker_stat_keys else []
         )
 
         worker_info = {}
@@ -224,16 +237,14 @@ class Queue:
         incomplete = await self.count("incomplete")
 
         if jobs:
-            deserialized_jobs = (
-                self.deserialize(job_bytes)
-                for job_bytes in await self.redis.mget(
-                    (await self.redis.lrange(self._active, offset, limit - 1))
-                    + (
-                        await self.redis.zrange(
-                            self._incomplete, offset, limit - 1, withscores=False
-                        )
-                    )
+            job_ids = (await self.redis.lrange(self._active, offset, limit - 1)) + (
+                await self.redis.zrange(
+                    self._incomplete, offset, limit - 1, withscores=False
                 )
+            )
+            job_values = await self.redis.mget(*job_ids) if job_ids else []
+            deserialized_jobs = (
+                self.deserialize(job_bytes) for job_bytes in job_values
             )
             job_info = list(
                 {
@@ -270,7 +281,7 @@ class Queue:
             "aborted": self.aborted,
             "uptime": current - self.started,
         }
-        async with self.redis.pipeline(transaction=True) as pipe:
+        async with self.redis.pipeline(transaction=not self.is_cluster) as pipe:
             key = self.namespace(f"stats:{self.uuid}")
             await (
                 pipe.setex(key, ttl, self._dump(stats))
@@ -364,7 +375,9 @@ class Queue:
                 else:
                     swept.append(job_id)
 
-                    async with self.redis.pipeline(transaction=True) as pipe:
+                    async with self.redis.pipeline(
+                        transaction=(not self.is_cluster)
+                    ) as pipe:
                         await (
                             pipe.lrem(self._active, 0, job_id)
                             .zrem(self._incomplete, job_id)
@@ -374,7 +387,6 @@ class Queue:
 
         return swept
 
-    # This method is no-op in the super class of Queue that we use in LangSmith.
     async def listen(
         self,
         job_keys: Iterable[str],
@@ -390,7 +402,7 @@ class Queue:
             timeout: if timeout is truthy, wait for timeout seconds
         """
         job_ids = [self.job_id(job_key) for job_key in job_keys]
-        if not job_ids:
+        if not job_ids or self._pubsub is None:
             return
 
         queue = await self._pubsub.subscribe(*job_ids)
@@ -416,11 +428,13 @@ class Queue:
             else:
                 await listen()
         finally:
-            await self._pubsub.unsubscribe(queue)
+            if self._pubsub is not None:
+                await self._pubsub.unsubscribe(queue)
 
     # We no-op this method in the super class of Queue that we use in LangSmith.
     async def notify(self, job: Job) -> None:
-        await self.redis.publish(job.id, job.status)
+        if not self.is_cluster:
+            await self.redis.publish(job.id, job.status)
 
     async def update(self, job: Job) -> None:
         job.touched = now()
@@ -438,7 +452,7 @@ class Queue:
     async def abort(self, job: Job, error: str, ttl: float = 5) -> None:
         # Safe since all keys are hash tagged with the queue name.
         async with self._op_sem:
-            async with self.redis.pipeline(transaction=True) as pipe:
+            async with self.redis.pipeline(transaction=not self.is_cluster) as pipe:
                 dequeued, *_ = await (
                     pipe.lrem(self._queued, 0, job.id)
                     .zrem(self._incomplete, job.id)
@@ -464,7 +478,7 @@ class Queue:
         job.touched = now()
         next_retry_delay = job.next_retry_delay()
 
-        async with self.redis.pipeline(transaction=True) as pipe:
+        async with self.redis.pipeline(transaction=not self.is_cluster) as pipe:
             pipe = pipe.lrem(self._active, 1, job_id)
             pipe = pipe.lrem(self._queued, 1, job_id)
             if next_retry_delay:
@@ -496,7 +510,7 @@ class Queue:
         if status == Status.COMPLETE:
             job.progress = 1.0
 
-        async with self.redis.pipeline(transaction=True) as pipe:
+        async with self.redis.pipeline(transaction=not self.is_cluster) as pipe:
             pipe = pipe.lrem(self._active, 1, job_id).zrem(self._incomplete, job_id)
 
             if job.ttl > 0:
@@ -556,6 +570,7 @@ class Queue:
         Returns:
             If the job has already been enqueued, this returns None, else Job
         """
+
         job_kwargs: dict[str, t.Any] = {}
 
         for k, v in kwargs.items():
@@ -597,7 +612,7 @@ class Queue:
 
         async with self._op_sem:
             if not await self._enqueue_script(
-                keys=[self._incomplete, job.id, self._queued, self._abort_key(job.key)],
+                keys=[self._incomplete, job.id, self._queued, self.abort_key(job.key)],
                 args=[self.serialize(job), job.scheduled],
                 client=self.redis,
             ):
