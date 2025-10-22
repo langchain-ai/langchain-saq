@@ -11,7 +11,7 @@ from saq.job import Job, Status
 from saq.queue import JobError
 from saq.utils import uuid1
 from saq.worker import Worker
-from tests.helpers import cleanup_queue, create_queue
+from tests.helpers import cleanup_queue, create_queue, create_cluster_queue
 
 if t.TYPE_CHECKING:
     from unittest.mock import MagicMock
@@ -30,9 +30,11 @@ async def error(_ctx: Context) -> None:
 functions: list[Function] = [echo, error]
 
 
-class TestQueue(unittest.IsolatedAsyncioTestCase):
+class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
+    _factory = staticmethod(create_queue)
+
     def setUp(self) -> None:
-        self.queue = create_queue()
+        self.queue = self._factory()
 
     async def asyncTearDown(self) -> None:
         await cleanup_queue(self.queue)
@@ -73,7 +75,11 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
 
     async def test_enqueue_dup(self) -> None:
         job = await self.enqueue("test", key="1")
-        self.assertEqual(job.id, "saq:job:default:1")
+        self.assertEqual(job.id, self.queue.job_id("1"))
+        if not self.queue.is_cluster:
+            self.assertEqual(job.id, "saq:job:default:1")
+        else:
+            self.assertEqual(job.id, "saq:job:{default}:1")
         self.assertIsNone(await self.queue.enqueue("test", key="1"))
         self.assertIsNone(await self.queue.enqueue(job))
 
@@ -106,7 +112,7 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
 
     async def test_dequeue_fifo(self) -> None:
         await cleanup_queue(self.queue)
-        self.queue = create_queue()
+        self.queue = self._factory()
         job = await self.enqueue("test")
         job_second = await self.enqueue("test_second")
         self.assertEqual(await self.count("queued"), 2)
@@ -246,7 +252,7 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(stats["uptime"], 0)
 
     async def test_info(self) -> None:
-        queue2 = create_queue(name=self.queue.name)
+        queue2 = self._factory(name=self.queue.name)
         self.addAsyncCleanup(cleanup_queue, queue2)
         worker = Worker(self.queue, functions=functions)
         info = await self.queue.info(jobs=True)
@@ -328,6 +334,11 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.count("active"), 2)
 
     async def test_update(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest(
+                "update relies on notify. Notify is not used in LangSmith services."
+            )
+
         job = await self.enqueue("test")
         counter = {"x": 0}
 
@@ -345,6 +356,9 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counter["x"], 2)
 
     async def test_apply(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest("apply relies on notify/listen. Disabled in cluster mode.")
+
         worker = Worker(self.queue, functions=functions)
         task = asyncio.create_task(worker.start())
 
@@ -357,6 +371,9 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         task.cancel()
 
     async def test_map(self) -> None:
+        if self.queue.is_cluster:
+            self.skipTest("map relies on notify/listen. Disabled in cluster mode.")
+
         worker = Worker(self.queue, functions=functions)
         task = asyncio.create_task(worker.start())
 
@@ -401,3 +418,11 @@ class TestQueue(unittest.IsolatedAsyncioTestCase):
         self.queue.unregister_before_enqueue(callback)
         await self.enqueue("test")
         self.assertIsNone(called_with_job)
+
+
+class TestQueue(BaseQueueTests):
+    _factory = staticmethod(create_queue)
+
+
+class TestQueueCluster(BaseQueueTests):
+    _factory = staticmethod(create_cluster_queue)
