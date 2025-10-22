@@ -13,6 +13,7 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 
 from redis import asyncio as aioredis
+from redis.asyncio.cluster import RedisCluster
 
 from saq.job import (
     TERMINAL_STATUSES,
@@ -22,11 +23,14 @@ from saq.job import (
     get_default_job_key,
 )
 from saq.utils import millis, now, seconds, uuid1
+from job import ABORT_ID_PREFIX
 
 if t.TYPE_CHECKING:
+    from job import ABORT_ID_PREFIX
     from collections.abc import AsyncIterator, Iterable, Sequence
 
     from redis.asyncio.client import Redis, PubSub
+    from redis.asyncio.cluster import RedisCluster
     from redis.commands.core import AsyncScript
 
     from saq.types import (
@@ -78,19 +82,24 @@ class Queue:
     """
 
     @classmethod
-    def from_url(cls: type[QueueT], url: str, **kwargs: t.Any) -> QueueT:
+    def from_url(cls: type[QueueT], url: str, is_cluster: bool = False, **kwargs: t.Any) -> QueueT:
         """Create a queue with a redis url a name."""
-        return cls(aioredis.from_url(url), **kwargs)
+        if is_cluster:
+            return cls(RedisCluster.from_url(url), is_cluster=True, **kwargs)
+        else:
+            return cls(aioredis.from_url(url), is_cluster=False, **kwargs)
 
-    def __init__(  # pylint: disable=too-many-arguments
+    def __init__(  # pylint: disable=too-many-positional-arguments
         self,
-        redis: Redis[bytes],
+        redis: Redis[bytes] | RedisCluster[bytes],
+        is_cluster: bool = False,
         name: str = "default",
         dump: DumpType | None = None,
         load: LoadType | None = None,
         max_concurrent_ops: int = 20,
     ) -> None:
         self.redis = redis
+        self.is_cluster = is_cluster
         self.name = name
         self.uuid: str = uuid1()
         self.started: int = now()
@@ -112,8 +121,9 @@ class Queue:
         self._load = load or json.loads
         self._before_enqueues: dict[int, BeforeEnqueueType] = {}
         self._op_sem = asyncio.Semaphore(max_concurrent_ops)
+        # Use the job_id("") as the pubsub prefix so the pattern aligns with the actual channel keys
         self._pubsub = PubSubMultiplexer(
-            redis.pubsub(), prefix=f"{ID_PREFIX}{self.name}"
+            redis.pubsub(), prefix=self.job_id("")
         )
 
     def __repr__(self) -> str:
@@ -126,6 +136,10 @@ class Queue:
         self._before_enqueues.pop(id(callback), None)
 
     def job_id(self, job_key: str) -> str:
+        # In cluster mode, ensure job keys share the same hash slot using a queue-level tag
+        if self.is_cluster:
+            return f"{ID_PREFIX}{{{self.name}}}:{job_key}"
+        # Non-cluster format
         return f"{ID_PREFIX}{self.name}:{job_key}"
 
     def job_key_from_id(self, job_id: str) -> str:
@@ -136,7 +150,19 @@ class Queue:
             await cb(job)
 
     def namespace(self, key: str) -> str:
+        # For cluster, use hash tagged format.
+        if self.is_cluster:
+            return ":".join(["saq", f"{{{self.name}}}", key])
+        # For non-cluster, use the legacy format
         return ":".join(["saq", self.name, key])
+
+    def abort_key(self, job_key: str) -> str:
+        # In cluster mode, we hash tag the queue name so the abort key shares the same slot as the queue and job.
+        if self.is_cluster:
+            return ":".join([ABORT_ID_PREFIX, f"{{{self.name}}}", job_key])
+        else:
+            # Else, use the legacy format
+            return f"{ABORT_ID_PREFIX}{job_key}"
 
     def serialize(self, job: Job) -> str:
         return self._dump(job.to_dict())
@@ -271,6 +297,7 @@ class Queue:
         raise ValueError("Can't count unknown type {kind}")
 
     async def schedule(self, lock: int = 1) -> t.Any:
+        # Safe since all keys in the lua script are prefixed with the queue name
         if not self._schedule_script:
             self._schedule_script = self.redis.register_script(
                 """
@@ -296,6 +323,7 @@ class Queue:
         )
 
     async def sweep(self, lock: int = 60) -> list[t.Any]:
+        # Safe since all keys in the lua script are prefixed with the queue name
         if not self._cleanup_script:
             self._cleanup_script = self.redis.register_script(
                 """
@@ -346,6 +374,7 @@ class Queue:
 
         return swept
 
+    # This method is no-op in the super class of Queue that we use in LangSmith.
     async def listen(
         self,
         job_keys: Iterable[str],
@@ -389,6 +418,7 @@ class Queue:
         finally:
             await self._pubsub.unsubscribe(queue)
 
+    # We no-op this method in the super class of Queue that we use in LangSmith.
     async def notify(self, job: Job) -> None:
         await self.redis.publish(job.id, job.status)
 
@@ -406,23 +436,25 @@ class Queue:
             return self.deserialize(await self.redis.get(job_id))
 
     async def abort(self, job: Job, error: str, ttl: float = 5) -> None:
+        # Safe since all keys are hash tagged with the queue name.
         async with self._op_sem:
             async with self.redis.pipeline(transaction=True) as pipe:
                 dequeued, *_ = await (
                     pipe.lrem(self._queued, 0, job.id)
                     .zrem(self._incomplete, job.id)
                     .expire(job.id, ttl + 1)
-                    .setex(job.abort_id, ttl, error)
+                    .setex(self.abort_key(job.key), ttl, error)
                     .execute()
                 )
 
             if dequeued:
                 await job.finish(Status.ABORTED, error=error)
-                await self.redis.delete(job.abort_id)
+                await self.redis.delete(self.abort_key(job.key))
             else:
                 await self.redis.lrem(self._active, 0, job.id)
 
     async def retry(self, job: Job, error: str | None) -> None:
+        # Safe since all keys used are hash tagged with the queue name.
         job_id = job.id
         job.status = Status.QUEUED
         job.error = error
@@ -454,6 +486,7 @@ class Queue:
         result: t.Any = None,
         error: str | None = None,
     ) -> None:
+        # Safe since all keys are hash tagged with the queue name.
         job_id = job.id
         job.status = status
         job.result = result
@@ -504,6 +537,7 @@ class Queue:
         logger.debug("Dequeue timed out")
         return None
 
+    # We override this method in the super class of Queue that we use in LangSmith.
     async def enqueue(self, job_or_func: str | Job, **kwargs: t.Any) -> Job | None:
         """
         Enqueue a job by instance or string.
@@ -563,7 +597,7 @@ class Queue:
 
         async with self._op_sem:
             if not await self._enqueue_script(
-                keys=[self._incomplete, job.id, self._queued, job.abort_id],
+                keys=[self._incomplete, job.id, self._queued, self._abort_key(job.key)],
                 args=[self.serialize(job), job.scheduled],
                 client=self.redis,
             ):
