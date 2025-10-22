@@ -148,6 +148,11 @@ class Queue:
         # Non-cluster format
         return f"{ID_PREFIX}{self.name}:{job_key}"
 
+    def job_key_from_id(self, job_id: str) -> str:
+        if self.is_cluster:
+            return job_id[len(f"{ID_PREFIX}{{{self.name}}}:") :]
+        return job_id[len(f"{ID_PREFIX}{self.name}:") :]
+
     async def _before_enqueue(self, job: Job) -> None:
         for cb in self._before_enqueues.values():
             await cb(job)
@@ -182,8 +187,10 @@ class Queue:
     async def disconnect(self) -> None:
         if self._pubsub is not None:
             await self._pubsub.close()
-
-        await self.redis.aclose()  # type: ignore[attr-defined]
+        if hasattr(self.redis, "aclose"):
+            await self.redis.aclose()
+        else:
+            await self.redis.close()
         if not self.is_cluster:
             await self.redis.connection_pool.disconnect()
 
@@ -310,13 +317,10 @@ class Queue:
                     local jobs = redis.call('ZRANGEBYSCORE', KEYS[2], 1, ARGV[2])
 
                     if next(jobs) then
-                        local scores = {}
                         for _, v in ipairs(jobs) do
-                            table.insert(scores, 0)
-                            table.insert(scores, v)
+                            redis.call('ZADD', KEYS[2], 0, v)
+                            redis.call('RPUSH', KEYS[3], v)
                         end
-                        redis.call('ZADD', KEYS[2], unpack(scores))
-                        redis.call('RPUSH', KEYS[3], unpack(jobs))
                     end
 
                     return jobs
@@ -350,7 +354,25 @@ class Queue:
             for job_id, job_bytes in zip(job_ids, await self.redis.mget(job_ids)):
                 job = self.deserialize(job_bytes)
 
-                if not job:
+                if job:
+                    # in rare cases a sweep may occur between a dequeue and actual processing.
+                    # in that case, the job status is still set to queued, but only because it hasn't
+                    # had its status updated yet. try refreshing after a short sleep to pick up the latest status.
+                    if job.status == Status.QUEUED:
+                        await asyncio.sleep(0.1)
+                        await job.refresh()
+                        stuck = job.status == Status.QUEUED
+                    else:
+                        stuck = job.status != Status.ACTIVE or job.stuck
+
+                    if stuck:
+                        swept.append(job_id)
+                        await job.finish(Status.ABORTED, error="swept")
+                        logger.info(
+                            "Sweeping job %s",
+                            job.info(logger.isEnabledFor(logging.DEBUG)),
+                        )
+                else:
                     swept.append(job_id)
 
                     async with self.redis.pipeline(
@@ -362,12 +384,7 @@ class Queue:
                             .execute()
                         )
                     logger.info("Sweeping missing job %s", job_id)
-                elif job.status != Status.ACTIVE or job.stuck:
-                    swept.append(job_id)
-                    await job.finish(Status.ABORTED, error="swept")
-                    logger.info(
-                        "Sweeping job %s", job.info(logger.isEnabledFor(logging.DEBUG))
-                    )
+
         return swept
 
     async def listen(
@@ -396,7 +413,7 @@ class Queue:
                 message = await queue.get()
                 queue.task_done()
                 job_id = message["channel"].decode("utf-8")
-                job_key = Job.key_from_id(job_id)
+                job_key = self.job_key_from_id(job_id)
                 status = Status[message["data"].decode("utf-8").upper()]
                 if asyncio.iscoroutinefunction(callback):
                     stop = await callback(job_key, status)
@@ -775,6 +792,7 @@ class PubSubMultiplexer:
         self._subscriptions: t.Dict[bytes, t.Set[Q]] = defaultdict(set)
         self._queues: t.Dict[Q, t.Set[bytes]] = {}
         self._daemon_task: t.Optional[asyncio.Task] = None
+        self._lock = asyncio.Lock()
 
     async def _daemon(self) -> None:
         while True:
@@ -790,8 +808,10 @@ class PubSubMultiplexer:
 
     async def start(self) -> None:
         if not self._daemon_task:
-            await self.pubsub.psubscribe(f"{self.prefix}*")
-            self._daemon_task = asyncio.create_task(self._daemon())
+            async with self._lock:
+                if not self._daemon_task:
+                    await self.pubsub.psubscribe(f"{self.prefix}*")
+                    self._daemon_task = asyncio.create_task(self._daemon())
 
     async def close(self) -> None:
         await self.pubsub.punsubscribe()

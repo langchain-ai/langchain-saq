@@ -103,6 +103,8 @@ To start the worker, assuming the previous is available in the python path
 saq module.file.settings
 ```
 
+> **_Note:_** `module.file.settings` can also be a callable returning the settings dictionary.
+
 To enqueue jobs
 
 ```python
@@ -115,6 +117,9 @@ print(job.results)
 
 # run a job and return the result
 print(await queue.apply("test", a=2))
+
+# Run multiple jobs concurrently and collect the results into a list
+print(await queue.map("test", [{"a": 3}, {"a": 4}]))
 
 # schedule a job in 10 seconds
 await queue.enqueue("test", a=1, scheduled=time.time() + 10)
