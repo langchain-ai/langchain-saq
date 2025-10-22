@@ -184,7 +184,6 @@ class Queue:
     async def disconnect(self) -> None:
         if self._pubsub is not None:
             await self._pubsub.close()
-
         if hasattr(self.redis, "aclose"):
             await self.redis.aclose()
         else:
