@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import typing as t
 import unittest
-
 import httpx
 
 from saq.web.starlette import saq_web
@@ -10,7 +9,9 @@ from saq.web.starlette import saq_web
 from .test_aiohttp import TestAiohttpWeb
 
 
-@unittest.skip("disable starlette tests, we don't use the web interfaces")
+@unittest.skip(
+    "Skipping Starlette tests. We are not using Starlette/Web UI in production."
+)
 class TestStarletteWeb(TestAiohttpWeb):
     async def get_application(self) -> t.Any:
         return saq_web("", queues=[self.queue1, self.queue2])

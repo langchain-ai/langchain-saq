@@ -93,7 +93,6 @@ class Queue:
             )
 
         return cls(aioredis.from_url(url), is_cluster=False, **kwargs)
-
     def __init__(  # pylint: disable=too-many-positional-arguments
         self,
         redis: Redis[bytes],
