@@ -423,8 +423,10 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual("a", self.queue.job_key_from_id(self.queue.job_id("a")))
         self.assertEqual("a:b", self.queue.job_key_from_id(self.queue.job_id("a:b")))
 
+
 class TestQueue(BaseQueueTests):
     _factory = staticmethod(create_queue)
+
 
 class TestQueueCluster(BaseQueueTests):
     _factory = staticmethod(create_cluster_queue)

@@ -93,6 +93,7 @@ class Queue:
             )
 
         return cls(aioredis.from_url(url), is_cluster=False, **kwargs)
+
     def __init__(  # pylint: disable=too-many-positional-arguments
         self,
         redis: Redis[bytes],
@@ -148,6 +149,8 @@ class Queue:
         return f"{ID_PREFIX}{self.name}:{job_key}"
 
     def job_key_from_id(self, job_id: str) -> str:
+        if self.is_cluster:
+            return job_id[len(f"{ID_PREFIX}{{{self.name}}}:") :]
         return job_id[len(f"{ID_PREFIX}{self.name}:") :]
 
     async def _before_enqueue(self, job: Job) -> None:
