@@ -334,14 +334,17 @@ class Queue:
         )
 
     async def sweep(self, lock: int = 60) -> list[t.Any]:
-        # Safe since all keys in the lua script are prefixed with the queue name
         if not self._cleanup_script:
             self._cleanup_script = self.redis.register_script(
                 """
+                local id_jobs = {}
                 if redis.call('EXISTS', KEYS[1]) == 0 then
                     redis.call('SETEX', KEYS[1], ARGV[1], 1)
-                    return redis.call('LRANGE', KEYS[2], 0, -1)
+                    for i, v in ipairs(redis.call('LRANGE', KEYS[2], 0, -1)) do
+                        id_jobs[i] = {v, redis.call('GET', v)}
+                    end
                 end
+                return id_jobs
                 """
             )
 
@@ -350,40 +353,48 @@ class Queue:
         )
 
         swept = []
-        if job_ids:
-            for job_id, job_bytes in zip(job_ids, await self.redis.mget(job_ids)):
-                job = self.deserialize(job_bytes)
+        for job_id, job_bytes in job_ids:
+            job = self.deserialize(job_bytes)
 
-                if job:
-                    # in rare cases a sweep may occur between a dequeue and actual processing.
-                    # in that case, the job status is still set to queued, but only because it hasn't
-                    # had its status updated yet. try refreshing after a short sleep to pick up the latest status.
-                    if job.status == Status.QUEUED:
-                        await asyncio.sleep(0.1)
-                        await job.refresh()
-                        stuck = job.status == Status.QUEUED
-                    else:
-                        stuck = job.status != Status.ACTIVE or job.stuck
+            if job:
+                # in rare cases a sweep may occur between a dequeue and actual processing.
+                # in that case, the job status is still set to queued, but only because it hasn't
+                # had its status updated yet. try refreshing after a short sleep to pick up the latest status.
+                if job.status == Status.QUEUED:
+                    await asyncio.sleep(0.1)
+                    await job.refresh()
+                    stuck = job.status == Status.QUEUED
+                else:
+                    stuck = job.status != Status.ACTIVE or job.stuck
 
-                    if stuck:
-                        swept.append(job_id)
-                        await job.finish(Status.ABORTED, error="swept")
+                if stuck:
+                    swept.append(job_id)
+                    await self.abort(job, error="swept")
+                    logger.info(
+                        "Sweeping job %s",
+                        job.info(logger.isEnabledFor(logging.DEBUG)),
+                    )
+
+                    if job.retryable:
+                        await self.retry(job, error="swept")
                         logger.info(
-                            "Sweeping job %s",
+                            "Retrying swept job %s",
                             job.info(logger.isEnabledFor(logging.DEBUG)),
                         )
-                else:
-                    swept.append(job_id)
+                    else:
+                        await job.finish(Status.ABORTED, error="swept")
+            else:
+                swept.append(job_id)
 
-                    async with self.redis.pipeline(
-                        transaction=(not self.is_cluster)
-                    ) as pipe:
-                        await (
-                            pipe.lrem(self._active, 0, job_id)
-                            .zrem(self._incomplete, job_id)
-                            .execute()
-                        )
-                    logger.info("Sweeping missing job %s", job_id)
+                async with self.redis.pipeline(
+                    transaction=(not self.is_cluster)
+                ) as pipe:
+                    await (
+                        pipe.lrem(self._active, 0, job_id)
+                        .zrem(self._incomplete, job_id)
+                        .execute()
+                    )
+                logger.info("Sweeping missing job %s", job_id)
 
         return swept
 
@@ -463,10 +474,10 @@ class Queue:
                 )
 
             if dequeued:
-                await job.finish(Status.ABORTED, error=error)
                 await self.redis.delete(self.abort_key(job.key))
             else:
                 await self.redis.lrem(self._active, 0, job.id)
+            await job.finish(Status.ABORTED, error=error)
 
     async def retry(self, job: Job, error: str | None) -> None:
         # Safe since all keys used are hash tagged with the queue name.

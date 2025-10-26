@@ -295,7 +295,7 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
     @mock.patch("saq.utils.time")
     async def test_sweep(self, mock_time: MagicMock) -> None:
         mock_time.time.return_value = 1
-        job1 = await self.enqueue("test", heartbeat=1)
+        job1 = await self.enqueue("test", heartbeat=1, retries=0)
         job2 = await self.enqueue("test", timeout=1)
         await self.enqueue("test", timeout=2)
         await self.enqueue("test", heartbeat=2)
@@ -328,9 +328,10 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
         await job1.refresh()
         await job2.refresh()
         await job3.refresh()
+        # Job1 is aborted because it's not retryable
         self.assertEqual(job1.status, Status.ABORTED)
-        self.assertEqual(job2.status, Status.ABORTED)
-        self.assertEqual(job3.status, Status.ABORTED)
+        self.assertEqual(job2.status, Status.QUEUED)
+        self.assertEqual(job3.status, Status.QUEUED)
         self.assertEqual(await self.count("active"), 2)
 
     async def test_update(self) -> None:
