@@ -378,7 +378,9 @@ class Queue:
                 else:
                     swept.append(job_id)
 
-                    async with self.redis.pipeline(transaction=not self.is_cluster) as pipe:
+                    async with self.redis.pipeline(
+                        transaction=not self.is_cluster
+                    ) as pipe:
                         await (
                             pipe.lrem(self._active, 0, job_id)
                             .zrem(self._incomplete, job_id)

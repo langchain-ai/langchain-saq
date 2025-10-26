@@ -333,7 +333,7 @@ class BaseQueueTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job2.status, Status.QUEUED)
         self.assertEqual(job3.status, Status.QUEUED)
         self.assertEqual(await self.count("active"), 2)
-    
+
     @mock.patch("saq.utils.time")
     async def test_retry_after_stuck(self, mock_time: MagicMock) -> None:
         job = await self.enqueue("test", heartbeat=1, retries=1)
